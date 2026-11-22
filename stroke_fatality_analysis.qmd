@@ -1,0 +1,510 @@
+---
+title: "Logistic Regression Analysis of Stroke Fatality"
+subtitle: "Clinical and Demographic Determinants of In-Hospital Stroke Mortality"
+author: "Amalina Anuar"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    number-sections: true
+    code-fold: show
+    code-tools: true
+execute:
+  warning: false
+  message: false
+---
+
+# Introduction & Study Overview
+
+This analysis investigates independent clinical and demographic factors associated with stroke fatality (`outcome`) using logistic regression in R. The study uses the dataset `stroke-fatality-cooked2.dta` (226 observations, 22 variables).
+
+## Statistical Assumptions
+
+1. **Binomial distribution** for the binary outcome (`0 = alive`, `1 = dead`).
+2. **Linearity in the logit** for continuous independent variables.
+3. **Correct model specification** without omission of critical confounders.
+
+---
+
+# Data Import, Cleaning & Validation
+
+We load the required analytical libraries, read the Stata `.dta` file using the `haven` package, clean variable names using `janitor`, apply factor levels with descriptive labels, and verify data entry consistency.
+
+```{r}
+#| label: setup-and-import
+library(haven)
+library(tidyverse)
+library(janitor)
+library(gtsummary)
+library(gt)
+library(broom)
+library(car)
+library(MASS)
+library(pROC)
+library(ResourceSelection)
+
+# Read raw dataset
+stroke_raw <- read_dta("stroke-fatality-cooked2.dta")
+
+# Clean column names
+stroke_df <- stroke_raw %>% clean_names()
+
+# Recode factor levels and numeric types
+stroke_df <- stroke_df %>%
+  mutate(
+    outcome        = factor(outcome, levels = c(0, 1), labels = c("alive", "dead")),
+    sex            = factor(sex, levels = c(1, 2), labels = c("male", "female")),
+    hypertension   = factor(hypertension, levels = c(0, 1), labels = c("no", "yes")),
+    maritalstat    = factor(maritalstat, levels = c(0, 1), labels = c("no", "yes")),
+    malay          = factor(malay, levels = c(0, 1), labels = c("no", "yes")),
+    diabetes       = factor(diabetes, levels = c(0, 1), labels = c("no", "yes")),
+    dyslipidaemia  = factor(dyslipidaemia, levels = c(0, 1), labels = c("no", "yes")),
+    referralcase   = factor(referralcase, levels = c(0, 1), labels = c("hospital", "GP/Home/Missing")),
+    stroketype     = factor(stroketype, levels = c(0, 1), labels = c("Ischaemic", "Haemorrhagic")),
+    # Numeric variables
+    across(c(gcs, sbp, dbp, hr, hb, plat, wbc, na, potas, cbs, urea, age), as.numeric)
+  )
+
+# Add binary 0/1 numeric outcome for modelling
+stroke_df <- stroke_df %>%
+  mutate(outcome_num = as.numeric(outcome) - 1)
+
+glimpse(stroke_df)
+```
+
+## Missing Data & Range Checks
+
+```{r}
+#| label: data-quality-checks
+# Missing data check
+missing_summary <- stroke_df %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  mutate(Missing_Pct = round(Missing_Count / nrow(stroke_df) * 100, 2))
+
+missing_summary %>%
+  filter(Missing_Count > 0) %>%
+  gt()
+
+# Summary statistics for numerical variables
+stroke_df %>%
+  dplyr::select(gcs, sbp, dbp, hr, hb, plat, wbc, na, potas, cbs, urea, age) %>%
+  summary()
+```
+
+The dataset contains complete observations ($N = 226$) across all 22 variables with **0 missing values**. Values fall within clinically plausible limits with one mild hypernatremia observation ($Na = 177\text{ mmol/L}$).
+
+---
+
+# Exploratory Data Analysis (EDA)
+
+## Baseline Characteristics (Table 1)
+
+Descriptive characteristics stratified by discharge outcome (`alive` vs `dead`) generated with `gtsummary`.
+
+```{r}
+#| label: table-1-descriptive
+table1 <- stroke_df %>%
+  dplyr::select(-rn, -outcome_num) %>%
+  tbl_summary(
+    by = outcome,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      all_continuous() ~ 2,
+      all_categorical() ~ c(0, 1)
+    ),
+    label = list(
+      gcs ~ "GCS (Glasgow Coma Scale)",
+      sbp ~ "Systolic BP (mmHg)",
+      dbp ~ "Diastolic BP (mmHg)",
+      hr  ~ "Heart Rate (bpm)",
+      hb  ~ "Hemoglobin (g/dL)",
+      plat ~ "Platelet (×10⁹/L)",
+      wbc ~ "WBC (×10⁹/L)",
+      na  ~ "Sodium (mmol/L)",
+      potas ~ "Potassium (mmol/L)",
+      cbs ~ "Capillary Blood Sugar (mmol/L)",
+      urea ~ "Urea (mmol/L)",
+      age ~ "Age (years)",
+      sex ~ "Sex",
+      hypertension ~ "Hypertension",
+      maritalstat ~ "Married",
+      malay ~ "Malay ethnicity",
+      diabetes ~ "Diabetes",
+      dyslipidaemia ~ "Dyslipidaemia",
+      referralcase ~ "Referral source",
+      stroketype ~ "Stroke type"
+    )
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  bold_p() %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Discharge Outcome**")
+
+table1
+```
+
+## Visualizations of Numerical Predictors
+
+### Histograms Stratified by Outcome
+
+```{r}
+#| label: eda-histograms
+#| fig-width: 10
+#| fig-height: 8
+num_vars <- c("gcs", "sbp", "dbp", "hr", "hb", "plat", "wbc", "na", "potas", "cbs", "urea", "age")
+
+stroke_df %>%
+  dplyr::select(all_of(num_vars), outcome) %>%
+  pivot_longer(cols = all_of(num_vars), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value, fill = outcome)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 25) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  scale_fill_manual(values = c("alive" = "#2563eb", "dead" = "#dc2626")) +
+  labs(title = "Histograms of Numerical Variables by Outcome",
+       x = "Value", y = "Count", fill = "Outcome") +
+  theme_minimal() +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+```
+
+### Box-plots for Outlier Detection
+
+```{r}
+#| label: eda-boxplots
+#| fig-width: 10
+#| fig-height: 8
+stroke_df %>%
+  dplyr::select(all_of(num_vars), outcome) %>%
+  pivot_longer(cols = all_of(num_vars), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = outcome, y = value, fill = outcome)) +
+  geom_boxplot(alpha = 0.7, outlier.colour = "darkred", outlier.size = 2) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("alive" = "#2563eb", "dead" = "#dc2626")) +
+  labs(title = "Box-Plots of Numerical Variables by Outcome",
+       x = "Discharge Outcome", y = "Value", fill = "Outcome") +
+  theme_minimal() +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+```
+
+## Bar Charts for Categorical Predictors
+
+```{r}
+#| label: eda-barcharts
+#| fig-width: 10
+#| fig-height: 8
+cat_vars <- c("sex", "hypertension", "maritalstat", "malay", "diabetes", "dyslipidaemia", "referralcase", "stroketype")
+
+stroke_df %>%
+  dplyr::select(all_of(cat_vars), outcome) %>%
+  pivot_longer(cols = all_of(cat_vars), names_to = "variable", values_to = "level") %>%
+  ggplot(aes(x = level, fill = outcome)) +
+  geom_bar(position = "dodge", alpha = 0.85) +
+  facet_wrap(~ variable, scales = "free", ncol = 2) +
+  scale_fill_manual(values = c("alive" = "#2563eb", "dead" = "#dc2626")) +
+  labs(title = "Distribution of Categorical Predictors by Outcome",
+       x = "", y = "Count", fill = "Outcome") +
+  theme_minimal() +
+  theme(legend.position = "bottom", strip.text = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+---
+
+# Univariable Logistic Regression Analysis
+
+We fit simple logistic regression models for each of the 20 candidate independent variables against `outcome_num`. Variables with a Wald test p-value $< 0.25$ are selected as candidates for the multivariable model.
+
+```{r}
+#| label: univariable-regression
+iv_vars <- c("sex", "gcs", "sbp", "dbp", "hr", "hb", "plat", "wbc",
+             "na", "potas", "cbs", "urea", "age",
+             "hypertension", "maritalstat", "malay", "diabetes",
+             "dyslipidaemia", "referralcase", "stroketype")
+
+univar_results <- map_dfr(iv_vars, function(var) {
+  form <- as.formula(paste("outcome_num ~", var))
+  fit <- glm(form, data = stroke_df, family = binomial)
+  
+  tidy(fit, conf.int = TRUE, exponentiate = FALSE) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      variable    = var,
+      log_odds    = estimate,
+      OR          = exp(estimate),
+      OR_lower    = exp(conf.low),
+      OR_upper    = exp(conf.high)
+    ) %>%
+    dplyr::select(variable, term, log_odds, std.error, OR, OR_lower, OR_upper, p.value)
+})
+
+# Display candidate table
+univar_results %>%
+  mutate(
+    Selected_Candidate = if_else(p.value < 0.25, "Yes (p < 0.25)", "No"),
+    across(c(log_odds, std.error, OR, OR_lower, OR_upper), ~ round(., 3)),
+    p.value = if_else(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value))
+  ) %>%
+  gt() %>%
+  tab_header(title = "Univariable Logistic Regression Results") %>%
+  cols_label(
+    variable = "Variable",
+    term = "Parameter",
+    log_odds = "Log-Odds (β)",
+    std.error = "SE",
+    OR = "Crude OR",
+    OR_lower = "95% CI Lower",
+    OR_upper = "95% CI Upper",
+    p.value = "p-value",
+    Selected_Candidate = "Selected (p < 0.25)"
+  )
+
+selected_vars <- univar_results %>%
+  filter(p.value < 0.25) %>%
+  pull(variable) %>%
+  unique()
+
+cat("Selected candidate variables for multivariable modelling:\n", paste(selected_vars, collapse = ", "))
+```
+
+---
+
+# Multivariable Logistic Regression Analysis
+
+## Multicollinearity Assessment
+
+Before fitting the multivariable model, we examine the correlation matrix among continuous candidate predictors and inspect the Variance Inflation Factor (VIF).
+
+```{r}
+#| label: multicollinearity-check
+cont_candidates <- intersect(selected_vars, c("gcs", "hr", "hb", "wbc", "na", "cbs"))
+cor_mat <- cor(stroke_df[, cont_candidates], use = "complete.obs")
+round(cor_mat, 3)
+
+# Preliminary full candidate model for VIF
+prelim_fit <- glm(as.formula(paste("outcome_num ~", paste(selected_vars, collapse = " + "))),
+                  data = stroke_df, family = binomial)
+
+vif_table <- tibble(
+  Variable = names(vif(prelim_fit)),
+  VIF = as.numeric(vif(prelim_fit))
+)
+vif_table %>% gt() %>% fmt_number(columns = VIF, decimals = 3)
+```
+
+All VIF values are well below 5 (maximum $\approx 1.62$), indicating no multicollinearity concerns.
+
+## Variable Selection (Forward Likelihood Ratio Stepwise)
+
+```{r}
+#| label: stepwise-selection
+null_model <- glm(outcome_num ~ 1, data = stroke_df, family = binomial)
+full_formula <- as.formula(paste("outcome_num ~", paste(selected_vars, collapse = " + ")))
+
+forward_model <- step(
+  null_model,
+  scope = list(lower = ~ 1, upper = full_formula),
+  direction = "forward",
+  test = "LRT",
+  trace = 0
+)
+
+summary(forward_model)
+```
+
+## Exploration of Interaction Terms
+
+We examine clinically meaningful two-way interactions:
+
+```{r}
+#| label: interaction-exploration
+# Test interactions with GCS and Stroke Type
+anova(forward_model, update(forward_model, ~ . + gcs:stroketype), test = "Chisq")
+anova(forward_model, update(forward_model, ~ . + gcs:referralcase), test = "Chisq")
+
+final_model <- forward_model
+```
+
+No interaction terms achieved statistical significance ($p > 0.05$). The forward LR model retaining **`gcs`** and **`sex`** is selected as the parsimonious final model.
+
+---
+
+# Overall Model Fitness & Evaluation
+
+## Receiver Operating Characteristic (ROC) & AUC
+
+```{r}
+#| label: roc-auc
+predicted_probs <- predict(final_model, type = "response")
+roc_obj <- roc(stroke_df$outcome_num, predicted_probs, quiet = TRUE)
+auc_ci <- ci.auc(roc_obj)
+
+cat("AUC:", round(auc(roc_obj), 4), "\n")
+cat("95% CI:", round(auc_ci[1], 4), "to", round(auc_ci[3], 4), "\n")
+
+plot(roc_obj, main = paste("ROC Curve (AUC =", round(auc(roc_obj), 3), ")"),
+     col = "#2563eb", lwd = 2.5, legacy.axes = TRUE,
+     print.auc = TRUE, print.auc.x = 0.4, print.auc.y = 0.2)
+```
+
+## Hosmer-Lemeshow Goodness-of-Fit Test
+
+```{r}
+#| label: hosmer-lemeshow
+hl_test <- hoslem.test(stroke_df$outcome_num, predicted_probs, g = 10)
+hl_test
+```
+
+With $p = 0.099 > 0.05$, we fail to reject the null hypothesis, demonstrating adequate goodness of fit across risk deciles.
+
+## Classification Accuracy & Model glance() using `broom`
+
+```{r}
+#| label: classification-accuracy
+# Model-level glance
+glance(final_model) %>% gt()
+
+# Classification matrix with broom::augment
+augmented_df <- augment(final_model, type.predict = "response") %>%
+  mutate(predicted_class = if_else(.fitted >= 0.5, 1, 0))
+
+conf_mat <- table(Predicted = augmented_df$predicted_class, Actual = augmented_df$outcome_num)
+conf_mat
+
+acc  <- sum(diag(conf_mat)) / sum(conf_mat)
+sens <- conf_mat[2, 2] / sum(conf_mat[, 2])
+spec <- conf_mat[1, 1] / sum(conf_mat[, 1])
+
+tibble(
+  Metric = c("Overall Accuracy", "Sensitivity", "Specificity"),
+  Percentage = c(acc * 100, sens * 100, spec * 100)
+) %>%
+  gt() %>%
+  fmt_number(columns = Percentage, decimals = 1, pattern = "{x}%")
+```
+
+---
+
+# Diagnostic Statistics
+
+We calculate diagnostic measures for all observations:
+
+- **Leverage ($h_i$)**: Hat values ($\text{cutoff} = 2p/n = 0.0265$)
+- **Delta-Beta ($\Delta\beta$)**: Cook's influence metric
+- **Delta Chi-Square ($\Delta\chi^2$)**: Change in Pearson chi-square statistic
+- **Delta Deviance ($\Delta D$)**: Change in model deviance
+
+```{r}
+#| label: diagnostic-plots
+#| fig-width: 10
+#| fig-height: 8
+n <- nrow(stroke_df)
+p <- length(coef(final_model))
+leverage_cutoff <- 2 * p / n
+
+diag_df <- augmented_df %>%
+  mutate(
+    obs_id        = row_number(),
+    leverage      = .hat,
+    cooks_d       = .cooksd,
+    pearson_resid = (outcome_num - .fitted) / sqrt(.fitted * (1 - .fitted)),
+    delta_chisq   = pearson_resid^2 / (1 - leverage),
+    dev_resid     = sign(outcome_num - .fitted) *
+                    sqrt(-2 * (outcome_num * log(.fitted) + (1 - outcome_num) * log(1 - .fitted))),
+    delta_dev     = dev_resid^2 / (1 - leverage),
+    delta_beta    = cooks_d * p
+  )
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+
+# 1. Leverage
+plot(diag_df$.fitted, diag_df$leverage,
+     xlab = "Predicted Probability", ylab = "Leverage (hat value)",
+     main = "Leverage vs Predicted Probability",
+     pch = 16, col = ifelse(diag_df$leverage > leverage_cutoff, "red", "steelblue"))
+abline(h = leverage_cutoff, lty = 2, col = "red")
+
+# 2. Delta-beta
+plot(diag_df$.fitted, diag_df$delta_beta,
+     xlab = "Predicted Probability", ylab = "Delta-Beta (Δβ)",
+     main = "Delta-Beta vs Predicted Probability",
+     pch = 16, col = ifelse(abs(diag_df$delta_beta) > 1, "red", "steelblue"))
+abline(h = c(-1, 1), lty = 2, col = "red")
+
+# 3. Delta Chi-square
+plot(diag_df$.fitted, diag_df$delta_chisq,
+     xlab = "Predicted Probability", ylab = "Delta Chi-Square (Δχ²)",
+     main = "Delta Chi-Square vs Predicted Probability",
+     pch = 16, col = ifelse(diag_df$delta_chisq > 4, "red", "steelblue"))
+abline(h = 4, lty = 2, col = "red")
+
+# 4. Delta Deviance
+plot(diag_df$.fitted, diag_df$delta_dev,
+     xlab = "Predicted Probability", ylab = "Delta Deviance (ΔD)",
+     main = "Delta Deviance vs Predicted Probability",
+     pch = 16, col = ifelse(diag_df$delta_dev > 4, "red", "steelblue"))
+abline(h = 4, lty = 2, col = "red")
+```
+
+---
+
+# Final Combined Results & Clinical Summary
+
+```{r}
+#| label: combined-results-table
+univar_table_data <- univar_results %>%
+  mutate(
+    uni_log_odds = sprintf("%.3f", log_odds),
+    uni_OR       = sprintf("%.3f", OR),
+    uni_CI       = sprintf("%.3f – %.3f", OR_lower, OR_upper),
+    uni_p        = if_else(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value))
+  ) %>%
+  dplyr::select(variable, term, uni_log_odds, uni_OR, uni_CI, uni_p)
+
+multi_tidy <- tidy(final_model, conf.int = TRUE, exponentiate = FALSE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    multi_log_odds = sprintf("%.3f", estimate),
+    multi_OR       = sprintf("%.3f", exp(estimate)),
+    multi_CI       = sprintf("%.3f – %.3f", exp(conf.low), exp(conf.high)),
+    multi_p        = if_else(p.value < 0.001, "< 0.001", sprintf("%.3f", p.value))
+  ) %>%
+  dplyr::select(term, multi_log_odds, multi_OR, multi_CI, multi_p)
+
+combined_table <- univar_table_data %>%
+  left_join(multi_tidy, by = "term") %>%
+  mutate(across(starts_with("multi_"), ~ replace_na(., "—")))
+
+combined_table %>%
+  dplyr::select(-term) %>%
+  rename(
+    Variable           = variable,
+    `Log-odds (β)`     = uni_log_odds,
+    `OR`               = uni_OR,
+    `95% CI`           = uni_CI,
+    `p-value`          = uni_p,
+    `Log-odds (β) `    = multi_log_odds,
+    `OR `              = multi_OR,
+    `95% CI `          = multi_CI,
+    `p-value `         = multi_p
+  ) %>%
+  gt() %>%
+  tab_spanner(label = "Univariable Logistic Regression", columns = c(`Log-odds (β)`, `OR`, `95% CI`, `p-value`)) %>%
+  tab_spanner(label = "Multivariable Logistic Regression", columns = c(`Log-odds (β) `, `OR `, `95% CI `, `p-value `)) %>%
+  tab_header(
+    title = "Logistic Regression of Stroke Fatality",
+    subtitle = "Crude and Adjusted Odds Ratios with 95% Confidence Intervals"
+  ) %>%
+  tab_footnote("Reference levels: Sex = male; Stroke type = Ischaemic; Referral = Hospital; Binary comorbidities = no.")
+```
+
+## Summary of Findings
+
+1. **Glasgow Coma Scale (`gcs`)**: Strongest independent protective factor ($\text{AOR} = 0.489$, $95\%\text{ CI: } 0.396 - 0.588$, $p < 0.001$). Higher consciousness at presentation substantially reduces the probability of stroke mortality.
+2. **Patient Sex (`sex`)**: Female stroke patients had lower in-hospital mortality odds compared to male patients ($\text{AOR} = 0.327$, $95\%\text{ CI: } 0.100 - 0.945$, $p = 0.044$) after controlling for GCS.
+3. **Discriminative Capacity**: The final model achieves outstanding discrimination ($\text{AUC} = 0.943$) and satisfactory calibration ($p = 0.099$).
